@@ -7,7 +7,7 @@ app = Flask(__name__)
 
 # Load the model and tokenizer
 MODEL_NAME = "Cognitive-Lab/LLama3-Gaja-Hindi-8B-v0.1"
-device = torch.device("mps")
+device = torch.device("cuda")
 
 print("Loading model...")
 model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16).to(device)

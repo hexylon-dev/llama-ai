@@ -242,7 +242,7 @@ def train_model(model, train_dataloader, num_epochs, learning_rate, device, save
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     
     # Load previous training state if exists
-    latest_checkpoint = get_latest_checkpoint(save_dir)
+    latest_checkpoint = 'model_checkpoints/checkpoint_epoch_1_batch_500.pt'
     if latest_checkpoint:
         epoch_num, batch_num, checkpoint_path = latest_checkpoint
         start_epoch, start_batch, last_loss = load_training_state(model, optimizer, checkpoint_path)

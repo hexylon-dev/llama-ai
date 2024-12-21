@@ -118,7 +118,7 @@ def main():
     logger = logging.getLogger(__name__)
     
     # Set device
-    device = torch.device("mps")
+    device = torch.device("cuda")
     logger.info(f"Using device: {device}")
     
     # Model and tokenizer initialization
@@ -128,7 +128,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
-        device_map="mps",
+        device_map="cuda",
         low_cpu_mem_usage=True
     ).to(device)
     model.gradient_checkpointing_enable()

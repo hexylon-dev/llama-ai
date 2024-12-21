@@ -5,6 +5,8 @@ import logging
 import os
 from tqdm import tqdm
 import json
+from tqdm import tqdm
+import json
 import glob
 
 class CustomDataset(Dataset):
@@ -130,77 +132,6 @@ def train_model(model, train_dataloader, num_epochs, learning_rate, device, save
         
         print(f'Epoch {epoch+1} completed. Average loss: {total_loss / len(train_dataloader)}')
 
-# def main():
-#     # Initialize logging
-#     logging.basicConfig(level=logging.INFO)
-#     logger = logging.getLogger(__name__)
-    
-#     # Set device
-#     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#     logger.info(f"Using device: {device}")
-    
-#     # Model and tokenizer initialization
-#     model_name = "Cognitive-Lab/LLama3-Gaja-Hindi-8B-v0.1"
-#     logger.info("Loading model and tokenizer...")
-    
-#     try:
-#         # Initialize tokenizer first
-#         tokenizer = AutoTokenizer.from_pretrained(
-#             model_name, 
-#             trust_remote_code=True,
-#             padding_side="left"  # Important for casual language modeling
-#         )
-        
-#         # Ensure pad token is set
-#         if tokenizer.pad_token is None:
-#             tokenizer.pad_token = tokenizer.eos_token
-        
-#         # Load model with memory optimizations
-#         model = AutoModelForCausalLM.from_pretrained(
-#             model_name,
-#             torch_dtype=torch.bfloat16,
-#             device_map="auto",
-#             low_cpu_mem_usage=True
-#         )
-#         model.gradient_checkpointing_enable()
-        
-#         # Load training data
-#         train_data_path = 'training_data.jsonl'
-#         logger.info(f"Loading training data from {train_data_path}")
-#         train_data = load_training_data(train_data_path)
-#         logger.info(f"Loaded {len(train_data)} conversation pairs")
-        
-#         # Create dataset and dataloader with proper collation
-#         dataset = CustomDataset(train_data, tokenizer)
-#         train_dataloader = DataLoader(
-#             dataset, 
-#             batch_size=1,  # Small batch size due to model size
-#             shuffle=True,
-#             collate_fn=default_data_collator
-#         )
-        
-#         # Training parameters
-#         num_epochs = 3
-#         learning_rate = 1e-5
-#         save_dir = './model_checkpoints'
-        
-#         # Start training
-#         logger.info("Starting training...")
-#         train_model(model, train_dataloader, num_epochs, learning_rate, device, save_dir)
-#         logger.info("Training completed successfully!")
-        
-#         # Save final model
-#         final_save_path = './fine_tuned_model'
-#         os.makedirs(final_save_path, exist_ok=True)
-#         model.save_pretrained(final_save_path)
-#         tokenizer.save_pretrained(final_save_path)
-#         logger.info(f"Model saved to {final_save_path}")
-        
-#     except Exception as e:
-#         logger.error(f"An error occurred during training: {str(e)}")
-#         raise  # Re-raise the exception for debugging
-
-
 def get_latest_checkpoint(checkpoint_dir):
     """Find the latest checkpoint in the directory"""
     checkpoints = glob.glob(os.path.join(checkpoint_dir, 'checkpoint_epoch_*_batch_*.pt'))
@@ -242,7 +173,7 @@ def train_model(model, train_dataloader, num_epochs, learning_rate, device, save
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     
     # Load previous training state if exists
-    latest_checkpoint = 'model_checkpoints/checkpoint_epoch_1_batch_500.pt'
+    latest_checkpoint = get_latest_checkpoint(save_dir)
     if latest_checkpoint:
         epoch_num, batch_num, checkpoint_path = latest_checkpoint
         start_epoch, start_batch, last_loss = load_training_state(model, optimizer, checkpoint_path)
@@ -367,7 +298,7 @@ def main():
         model.gradient_checkpointing_enable()
         
         # Find latest checkpoint
-        latest_checkpoint = 'model_checkpoints/checkpoint_epoch_1_batch_500.pt'
+        latest_checkpoint = get_latest_checkpoint(checkpoint_dir)
         start_epoch = 0
         start_batch = 0
         

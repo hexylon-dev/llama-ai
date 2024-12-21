@@ -367,7 +367,7 @@ def main():
         model.gradient_checkpointing_enable()
         
         # Find latest checkpoint
-        latest_checkpoint = get_latest_checkpoint(checkpoint_dir)
+        latest_checkpoint = 'model_checkpoints/checkpoint_epoch_1_batch_500.pt'
         start_epoch = 0
         start_batch = 0
         

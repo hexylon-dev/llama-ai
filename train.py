@@ -1,73 +1,173 @@
-def verify_checkpoint_file(checkpoint_path):
-    """Verify if checkpoint file is valid"""
-    try:
-        # Try to load the checkpoint file
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        required_keys = ['model_state_dict', 'optimizer_state_dict', 'epoch', 'batch']
-        return all(key in checkpoint for key in required_keys)
-    except Exception as e:
-        logging.error(f"Error verifying checkpoint {checkpoint_path}: {str(e)}")
-        return False
+import torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoModelForCausalLM, AutoTokenizer, default_data_collator
+import logging
+import os
+from tqdm import tqdm
+import json
 
-def find_latest_valid_checkpoint(checkpoint_dir):
-    """Find the latest valid checkpoint in directory"""
-    checkpoints = glob.glob(os.path.join(checkpoint_dir, 'checkpoint_epoch_*_batch_*.pt'))
-    valid_checkpoints = []
-    
-    for checkpoint_path in checkpoints:
-        try:
-            if verify_checkpoint_file(checkpoint_path):
-                # Extract epoch and batch numbers
-                parts = os.path.basename(checkpoint_path).replace('.pt', '').split('_')
-                epoch = int(parts[2])
-                batch = int(parts[4])
-                valid_checkpoints.append((epoch, batch, checkpoint_path))
-        except Exception as e:
-            logging.warning(f"Skipping invalid checkpoint {checkpoint_path}: {str(e)}")
-            continue
-    
-    if not valid_checkpoints:
-        return None
-        
-    # Sort by epoch and batch
-    valid_checkpoints.sort(key=lambda x: (x[0], x[1]))
-    return valid_checkpoints[-1]
+# [Previous CustomDataset and load_training_data functions remain the same]
+class CustomDataset(Dataset):
+    def __init__(self, data, tokenizer, max_length=256):
+        self.data = data
+        self.tokenizer = tokenizer
+        self.max_length = max_length
 
-def safe_load_checkpoint(model, optimizer, device='cuda'):
-    """Safely load checkpoint with fallback options"""
-    checkpoint_dir = './model_checkpoints'
-    specified_checkpoint = os.path.join(checkpoint_dir, 'checkpoint_epoch_1_batch_500.pt')
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        conversation = self.data[idx]
+        
+        messages = [
+            {"role": msg["role"], "content": msg["content"]}
+            for msg in conversation
+        ]
+        
+        # Apply chat template with proper padding
+        encoded = self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            padding="max_length",
+            max_length=self.max_length,
+            truncation=True,
+            return_tensors="pt"
+        )
+        
+        # Create attention mask
+        attention_mask = (encoded != self.tokenizer.pad_token_id).long()
+        
+        return {
+            "input_ids": encoded[0],
+            "attention_mask": attention_mask[0],
+            "labels": encoded[0].clone()  # Use same sequence for labels
+        }
+
+def load_checkpoint(checkpoint_path, model, optimizer, device):
+    """Load checkpoint with error handling"""
+    logger = logging.getLogger(__name__)
+    logger.info(f"Loading checkpoint: {checkpoint_path}")
     
     try:
-        # First try loading the specified checkpoint
-        if os.path.exists(specified_checkpoint):
-            logging.info(f"Attempting to load specified checkpoint: {specified_checkpoint}")
-            checkpoint = torch.load(specified_checkpoint, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            return checkpoint['epoch'], checkpoint['batch'], checkpoint.get('loss', 0)
-            
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        return checkpoint['epoch'], checkpoint['batch'], checkpoint.get('loss', 0)
     except Exception as e:
-        logging.warning(f"Failed to load specified checkpoint: {str(e)}")
-        
-    # If specified checkpoint fails, try finding latest valid checkpoint
-    logging.info("Searching for latest valid checkpoint...")
-    latest_valid = find_latest_valid_checkpoint(checkpoint_dir)
+        logger.error(f"Error loading checkpoint: {str(e)}")
+        raise
+
+def train_model(model, train_dataloader, num_epochs, learning_rate, device, save_dir, start_epoch=0, start_batch=0):
+    model.train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     
-    if latest_valid:
-        epoch_num, batch_num, checkpoint_path = latest_valid
+    # Load from checkpoint if specified
+    if start_epoch > 0 or start_batch > 0:
+        checkpoint_path = os.path.join(save_dir, f'checkpoint_epoch_{start_epoch+1}_batch_{start_batch}.pt')
         try:
-            logging.info(f"Loading latest valid checkpoint from epoch {epoch_num+1}, batch {batch_num+1}")
-            checkpoint = torch.load(checkpoint_path, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            return epoch_num, batch_num, checkpoint.get('loss', 0)
+            start_epoch, start_batch, last_loss = load_checkpoint(checkpoint_path, model, optimizer, device)
+            logging.info(f"Resuming from epoch {start_epoch+1}, batch {start_batch+1}")
         except Exception as e:
-            logging.error(f"Error loading latest valid checkpoint: {str(e)}")
+            logging.error(f"Failed to load checkpoint: {str(e)}")
+            logging.info("Starting training from beginning")
+            start_epoch = 0
+            start_batch = 0
     
-    # If all checkpoints fail, start from beginning
-    logging.warning("No valid checkpoints found. Starting from beginning.")
-    return 0, 0, 0
+    os.makedirs(save_dir, exist_ok=True)
+    
+    for epoch in range(start_epoch, num_epochs):
+        total_loss = 0
+        progress_bar = tqdm(train_dataloader, desc=f'Epoch {epoch+1}/{num_epochs}')
+        
+        # Skip processed batches if resuming
+        if epoch == start_epoch and start_batch > 0:
+            logging.info(f"Skipping to batch {start_batch+1}")
+            for _ in range(start_batch):
+                try:
+                    next(iter(progress_bar))
+                except StopIteration:
+                    break
+        
+        for batch_idx, batch in enumerate(progress_bar, start=start_batch if epoch == start_epoch else 0):
+            try:
+                # Move batch to device
+                input_ids = batch["input_ids"].to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                labels = batch["labels"].to(device)
+                
+                # Clear any leftover gradients
+                model.zero_grad()
+                optimizer.zero_grad()
+                
+                # Forward pass
+                outputs = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels
+                )
+                
+                loss = outputs.loss
+                
+                # Backward pass
+                loss.backward()
+                
+                # Gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                # Update weights
+                optimizer.step()
+                
+                # Update progress bar
+                total_loss += loss.item()
+                avg_loss = total_loss / (batch_idx - start_batch + 1 if batch_idx >= start_batch else 1)
+                progress = (batch_idx + 1) / len(train_dataloader) * 100
+                progress_bar.set_postfix({
+                    'loss': f'{avg_loss:.4f}',
+                    'progress': f'{progress:.2f}%'
+                })
+                
+                # Save checkpoint every 100 batches
+                if (batch_idx + 1) % 100 == 0:
+                    checkpoint_path = os.path.join(
+                        save_dir, 
+                        f'checkpoint_epoch_{epoch+1}_batch_{batch_idx+1}.pt'
+                    )
+                    torch.save({
+                        'epoch': epoch,
+                        'batch': batch_idx,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'loss': avg_loss,
+                    }, checkpoint_path)
+                
+                # Clear memory
+                del outputs, loss, input_ids, attention_mask, labels
+                torch.cuda.empty_cache()
+                
+            except Exception as e:
+                logging.error(f"Error in batch {batch_idx}: {str(e)}")
+                # Save emergency checkpoint
+                emergency_path = os.path.join(
+                    save_dir,
+                    f'emergency_checkpoint_epoch_{epoch+1}_batch_{batch_idx+1}.pt'
+                )
+                torch.save({
+                    'epoch': epoch,
+                    'batch': batch_idx,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': avg_loss if 'avg_loss' in locals() else 0,
+                }, emergency_path)
+                raise
+        
+        # Reset start_batch after first epoch
+        start_batch = 0
+        
+        # Save model after each epoch
+        model_path = os.path.join(save_dir, f'model_epoch_{epoch+1}.pt')
+        torch.save(model.state_dict(), model_path)
+        
+        print(f'Epoch {epoch+1} completed. Average loss: {total_loss / len(train_dataloader)}')
 
 def main():
     # Initialize logging
@@ -81,15 +181,17 @@ def main():
     )
     logger = logging.getLogger(__name__)
     
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Using device: {device}")
+    
+    # Configuration
+    model_name = "Cognitive-Lab/LLama3-Gaja-Hindi-8B-v0.1"
+    checkpoint_path = './model_checkpoints/checkpoint_epoch_1_batch_500.pt'
+    
     try:
-        # Set device
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(f"Using device: {device}")
-        
-        # Initialize model and tokenizer
-        model_name = "Cognitive-Lab/LLama3-Gaja-Hindi-8B-v0.1"
-        
-        # Load tokenizer
+        # Initialize tokenizer
+        logger.info("Loading tokenizer...")
         tokenizer = AutoTokenizer.from_pretrained(
             model_name, 
             trust_remote_code=True,
@@ -99,7 +201,7 @@ def main():
             tokenizer.pad_token = tokenizer.eos_token
         
         # Load model
-        logger.info("Loading base model...")
+        logger.info("Loading model...")
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
@@ -108,11 +210,17 @@ def main():
         )
         model.gradient_checkpointing_enable()
         
-        # Initialize optimizer
+        # Initialize optimizer (needed for loading checkpoint)
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
         
-        # Try to load checkpoint
-        start_epoch, start_batch, last_loss = safe_load_checkpoint(model, optimizer, device)
+        # Load checkpoint
+        start_epoch = 0
+        start_batch = 0
+        if os.path.exists(checkpoint_path):
+            logger.info(f"Found checkpoint at {checkpoint_path}")
+            start_epoch, start_batch, _ = load_checkpoint(checkpoint_path, model, optimizer, device)
+            start_batch += 1  # Start from next batch
+            logger.info(f"Resuming from epoch {start_epoch+1}, batch {start_batch}")
         
         # Load training data
         train_data_path = 'training_data.jsonl'
@@ -134,12 +242,8 @@ def main():
         learning_rate = 1e-5
         save_dir = './model_checkpoints'
         
-        # Start/Resume training
-        if start_batch > 0 or start_epoch > 0:
-            logger.info(f"Resuming training from epoch {start_epoch+1}, batch {start_batch+1}")
-        else:
-            logger.info("Starting training from beginning")
-            
+        # Resume training
+        logger.info("Resuming training...")
         train_model(
             model, 
             train_dataloader, 
@@ -161,7 +265,7 @@ def main():
         logger.info(f"Model saved to {final_save_path}")
         
     except Exception as e:
-        logger.error(f"Fatal error: {str(e)}\n{traceback.format_exc()}")
+        logger.error(f"An error occurred: {str(e)}")
         raise
 
 if __name__ == "__main__":

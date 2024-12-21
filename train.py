@@ -1,281 +1,58 @@
-import torch
-from torch.utils.data import Dataset, DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer, default_data_collator
-import logging
-import os
-from tqdm import tqdm
-import json
-from tqdm import tqdm
-import json
-import glob
-
-class CustomDataset(Dataset):
-    def __init__(self, data, tokenizer, max_length=256):
-        self.data = data
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        conversation = self.data[idx]
-        
-        messages = [
-            {"role": msg["role"], "content": msg["content"]}
-            for msg in conversation
-        ]
-        
-        # Apply chat template with proper padding
-        encoded = self.tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            padding="max_length",
-            max_length=self.max_length,
-            truncation=True,
-            return_tensors="pt"
-        )
-        
-        # Create attention mask
-        attention_mask = (encoded != self.tokenizer.pad_token_id).long()
-        
-        return {
-            "input_ids": encoded[0],
-            "attention_mask": attention_mask[0],
-            "labels": encoded[0].clone()  # Use same sequence for labels
-        }
-
-def load_training_data(file_path):
-    """Load training data where each line is a JSON array containing a conversation pair"""
-    conversations = []
-    with open(file_path, 'r', encoding='utf-8') as f:
-        for line_num, line in enumerate(f, 1):
-            if line.strip():
-                try:
-                    conversation = json.loads(line.strip())
-                    if len(conversation) != 2:
-                        logging.warning(f"Line {line_num}: Expected 2 messages, got {len(conversation)}. Skipping.")
-                        continue
-                    if conversation[0]["role"] != "user" or conversation[1]["role"] != "assistant":
-                        logging.warning(f"Line {line_num}: Invalid roles. Expected user-assistant pair. Skipping.")
-                        continue
-                    conversations.append(conversation)
-                except json.JSONDecodeError as e:
-                    logging.warning(f"Line {line_num}: Invalid JSON: {str(e)}")
-                    continue
-                except Exception as e:
-                    logging.warning(f"Line {line_num}: Error processing line: {str(e)}")
-                    continue
+def load_specific_checkpoint(checkpoint_path, model, optimizer=None, map_location=None):
+    """Load a specific checkpoint file with validation"""
+    logger = logging.getLogger(__name__)
     
-    logging.info(f"Successfully loaded {len(conversations)} conversations")
-    return conversations
-
-def train_model(model, train_dataloader, num_epochs, learning_rate, device, save_dir):
-    model.train()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    
-    os.makedirs(save_dir, exist_ok=True)
-    
-    for epoch in range(num_epochs):
-        total_loss = 0
-        progress_bar = tqdm(train_dataloader, desc=f'Epoch {epoch+1}/{num_epochs}')
+    # Verify file exists
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
         
-        for batch_idx, batch in enumerate(progress_bar):
-            # Move batch to device
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
+    try:
+        if map_location is None:
+            map_location = 'cuda' if torch.cuda.is_available() else 'cpu'
             
-            # Clear any leftover gradients
-            model.zero_grad()
-            
-            # Forward pass with proper attention mask
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels
-            )
-            
-            loss = outputs.loss
-            
-            # Backward pass
-            loss.backward()
-            
-            # Gradient clipping to prevent exploding gradients
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            # Update weights
-            optimizer.step()
-            
-            # Update progress bar
-            total_loss += loss.item()
-            progress_bar.set_postfix({'loss': total_loss / (batch_idx + 1)})
-            
-            # Save checkpoint every 100 batches
-            if (batch_idx + 1) % 100 == 0:
-                checkpoint_path = os.path.join(save_dir, f'checkpoint_epoch_{epoch+1}_batch_{batch_idx+1}.pt')
-                torch.save({
-                    'epoch': epoch,
-                    'batch': batch_idx,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': loss.item(),
-                }, checkpoint_path)
-                
-            # Clear memory
-            del outputs, loss
-            torch.cuda.empty_cache()
+        logger.info(f"Loading checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=map_location)
         
-        # Save model after each epoch
-        model_path = os.path.join(save_dir, f'model_epoch_{epoch+1}.pt')
-        torch.save(model.state_dict(), model_path)
+        # Verify checkpoint structure
+        required_keys = ['epoch', 'batch', 'model_state_dict']
+        if not all(k in checkpoint for k in required_keys):
+            raise ValueError(f"Checkpoint missing required keys: {[k for k in required_keys if k not in checkpoint]}")
         
-        print(f'Epoch {epoch+1} completed. Average loss: {total_loss / len(train_dataloader)}')
-
-def get_latest_checkpoint(checkpoint_dir):
-    """Find the latest checkpoint in the directory"""
-    checkpoints = glob.glob(os.path.join(checkpoint_dir, 'checkpoint_epoch_*_batch_*.pt'))
-    if not checkpoints:
-        return None
-        
-    # Extract epoch and batch numbers from filenames
-    checkpoint_info = []
-    for checkpoint in checkpoints:
-        base = os.path.basename(checkpoint)
+        # Load model state
         try:
-            # Extract epoch and batch numbers from filename
-            parts = base.replace('.pt', '').split('_')
-            epoch = int(parts[2])
-            batch = int(parts[4])
-            checkpoint_info.append((epoch, batch, checkpoint))
-        except:
-            continue
+            model.load_state_dict(checkpoint['model_state_dict'])
+            logger.info("Successfully loaded model state")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load model state: {str(e)}")
             
-    if not checkpoint_info:
-        return None
-        
-    # Sort by epoch and batch number
-    checkpoint_info.sort(key=lambda x: (x[0], x[1]))
-    return checkpoint_info[-1]  # Return the latest checkpoint
-
-def load_training_state(model, optimizer, checkpoint_path):
-    """Load model and optimizer state from checkpoint"""
-    logging.info(f"Loading checkpoint from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path)
-    
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    
-    return checkpoint['epoch'], checkpoint['batch'], checkpoint['loss']
-
-def train_model(model, train_dataloader, num_epochs, learning_rate, device, save_dir, start_epoch=0, start_batch=0):
-    model.train()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    
-    # Load previous training state if exists
-    latest_checkpoint = get_latest_checkpoint(save_dir)
-    if latest_checkpoint:
-        epoch_num, batch_num, checkpoint_path = latest_checkpoint
-        start_epoch, start_batch, last_loss = load_training_state(model, optimizer, checkpoint_path)
-        logging.info(f"Resuming from epoch {start_epoch+1}, batch {start_batch+1}")
-    
-    os.makedirs(save_dir, exist_ok=True)
-    
-    for epoch in range(start_epoch, num_epochs):
-        total_loss = 0
-        progress_bar = tqdm(train_dataloader, desc=f'Epoch {epoch+1}/{num_epochs}')
-        
-        # Skip batches that were already processed in the current epoch
-        if epoch == start_epoch:
-            for _ in range(start_batch):
-                next(iter(progress_bar))
-        
-        for batch_idx, batch in enumerate(progress_bar, start=start_batch if epoch == start_epoch else 0):
-            # Move batch to device
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            labels = batch["labels"].to(device)
-            
-            # Clear any leftover gradients
-            model.zero_grad()
-            
+        # Load optimizer state if provided
+        if optimizer is not None and 'optimizer_state_dict' in checkpoint:
             try:
-                # Forward pass with proper attention mask
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels
-                )
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                logger.info("Successfully loaded optimizer state")
+            except Exception as e:
+                logger.warning(f"Failed to load optimizer state: {str(e)}")
                 
-                loss = outputs.loss
-                
-                # Backward pass
-                loss.backward()
-                
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                
-                # Update weights
-                optimizer.step()
-                
-                # Update progress bar
-                total_loss += loss.item()
-                avg_loss = total_loss / (batch_idx + 1)
-                progress_bar.set_postfix({
-                    'loss': avg_loss,
-                    'progress': f"{((batch_idx + 1) / len(train_dataloader)) * 100:.2f}%"
-                })
-                
-                # Save checkpoint every 100 batches
-                if (batch_idx + 1) % 100 == 0:
-                    checkpoint_path = os.path.join(save_dir, f'checkpoint_epoch_{epoch+1}_batch_{batch_idx+1}.pt')
-                    torch.save({
-                        'epoch': epoch,
-                        'batch': batch_idx,
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'loss': loss.item(),
-                    }, checkpoint_path)
-                    
-                # Clear memory
-                del outputs, loss
-                torch.cuda.empty_cache()
-                
-            except RuntimeError as e:
-                logging.error(f"Error during training: {str(e)}")
-                logging.info("Saving emergency checkpoint...")
-                
-                # Save emergency checkpoint
-                emergency_path = os.path.join(save_dir, f'emergency_checkpoint_epoch_{epoch+1}_batch_{batch_idx+1}.pt')
-                torch.save({
-                    'epoch': epoch,
-                    'batch': batch_idx,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': total_loss / (batch_idx + 1) if batch_idx > 0 else 0,
-                }, emergency_path)
-                raise
+        return checkpoint['epoch'], checkpoint['batch'], checkpoint.get('loss', 0)
         
-        # Reset start_batch after first epoch
-        start_batch = 0
-        
-        # Save model after each epoch
-        model_path = os.path.join(save_dir, f'model_epoch_{epoch+1}.pt')
-        torch.save(model.state_dict(), model_path)
-        
-        print(f'Epoch {epoch+1} completed. Average loss: {total_loss / len(train_dataloader)}')
+    except Exception as e:
+        logger.error(f"Error loading checkpoint {checkpoint_path}: {str(e)}")
+        raise
 
 def main():
     # Initialize logging
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s'
+    )
     logger = logging.getLogger(__name__)
     
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     
-    # Paths
-    checkpoint_dir = './model_checkpoints'
+    # Specific checkpoint path
+    checkpoint_path = './model_checkpoints/checkpoint_epoch_1_batch_500.pt'
     model_name = "Cognitive-Lab/LLama3-Gaja-Hindi-8B-v0.1"
     
     try:
@@ -289,6 +66,7 @@ def main():
             tokenizer.pad_token = tokenizer.eos_token
         
         # Load model
+        logger.info("Loading base model...")
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
@@ -297,25 +75,33 @@ def main():
         )
         model.gradient_checkpointing_enable()
         
-        # Find latest checkpoint
-        latest_checkpoint = get_latest_checkpoint(checkpoint_dir)
-        start_epoch = 0
-        start_batch = 0
+        # Initialize optimizer
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
         
-        if latest_checkpoint:
-            epoch_num, batch_num, checkpoint_path = latest_checkpoint
-            logger.info(f"Found checkpoint at epoch {epoch_num+1}, batch {batch_num+1}")
-            checkpoint = torch.load(checkpoint_path)
-            model.load_state_dict(checkpoint['model_state_dict'])
-            start_epoch = epoch_num
-            start_batch = batch_num + 1  # Start from next batch
+        # Load specific checkpoint
+        try:
+            start_epoch, start_batch, last_loss = load_specific_checkpoint(
+                checkpoint_path,
+                model,
+                optimizer,
+                map_location='cuda'
+            )
+            start_batch += 1  # Start from next batch
+            logger.info(f"Successfully loaded checkpoint. Resuming from epoch {start_epoch+1}, batch {start_batch}")
+            logger.info(f"Last recorded loss: {last_loss}")
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {str(e)}")
+            logger.info("Starting training from beginning...")
+            start_epoch = 0
+            start_batch = 0
         
-        # Load training data and create dataloader (same as before)
+        # Load training data
         train_data_path = 'training_data.jsonl'
         logger.info(f"Loading training data from {train_data_path}")
         train_data = load_training_data(train_data_path)
         logger.info(f"Loaded {len(train_data)} conversation pairs")
         
+        # Create dataset and dataloader
         dataset = CustomDataset(train_data, tokenizer)
         train_dataloader = DataLoader(
             dataset, 
@@ -327,16 +113,17 @@ def main():
         # Training parameters
         num_epochs = 3
         learning_rate = 1e-5
+        save_dir = './model_checkpoints'
         
         # Resume training
-        logger.info("Resuming training...")
+        logger.info("Starting/Resuming training...")
         train_model(
             model, 
             train_dataloader, 
             num_epochs, 
             learning_rate, 
             device, 
-            checkpoint_dir,
+            save_dir,
             start_epoch=start_epoch,
             start_batch=start_batch
         )

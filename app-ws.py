@@ -12,7 +12,7 @@ socketio = SocketIO(app, cors_allowed_origins="*")
 
 # Load the model and tokenizer
 MODEL_NAME = "Cognitive-Lab/LLama3-Gaja-Hindi-8B-v0.1"
-device = torch.device("mps")  # Change to "cuda" if using NVIDIA GPU
+device = torch.device("cuda")  # Change to "cuda" if using NVIDIA GPU
 
 print("Loading model...")
 model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16).to(device)
